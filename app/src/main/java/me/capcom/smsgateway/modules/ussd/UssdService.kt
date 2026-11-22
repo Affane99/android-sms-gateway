@@ -3,38 +3,40 @@ package me.capcom.smsgateway.modules.ussd
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
-import android.telecom.PhoneAccountHandle
-import android.telecom.TelecomManager
+import android.os.Handler
+import android.os.Looper
+import android.telephony.TelephonyManager
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import me.capcom.smsgateway.helpers.SubscriptionsHelper
 import me.capcom.smsgateway.modules.webhooks.WebHooksService
 import me.capcom.smsgateway.modules.webhooks.domain.WebHookEvent
-import java.text.Normalizer
 import java.util.Date
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.resume
 
 /** Id déjà composé dont l'état a été perdu (redémarrage) : le serveur doit se fier au SMS. */
 class UssdAlreadyDialedException(id: String) :
     Exception("La session $id a déjà été composée ; son état est inconnu, se fier au SMS de l'opérateur.")
 
 /**
- * Exécute les sessions USSD une par une (le téléphone ne peut en tenir qu'une à la fois).
+ * Compose des codes USSD complets en une fois (TelephonyManager.sendUssdRequest, Android 8+),
+ * une session à la fois, et rapporte la réponse de l'opérateur.
  *
- * Le service ne CONFIRME aucun transfert : il compose, répond aux menus et rapporte ce que
- * l'opérateur a affiché. La preuve d'un transfert reste le SMS de l'opérateur, analysé par le serveur.
- * Un ussd:failed (délai dépassé surtout) ne prouve donc PAS que l'argent n'est pas parti.
+ * Le téléphone ne décide rien : le serveur fournit le code, vérifie la réponse, et seule la
+ * preuve de l'opérateur (SMS) confirme un mouvement d'argent.
  */
 class UssdService(
     private val context: Context,
@@ -44,15 +46,6 @@ class UssdService(
     private val sessions = ConcurrentHashMap<String, UssdSession>()
     private val queue = Channel<UssdSession>(Channel.UNLIMITED)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    /** Session en cours, lue par le service d'accessibilité. */
-    @Volatile
-    var current: UssdSession? = null
-        private set
-
-    /** Dernier écran traité : les événements d'accessibilité arrivent plusieurs fois pour le même écran. */
-    @Volatile
-    private var lastScreen: String? = null
 
     init {
         scope.launch {
@@ -73,7 +66,6 @@ class UssdService(
         val session = UssdSession(
             id = id,
             code = request.code!!.trim(),
-            steps = request.steps ?: emptyList(),
             simNumber = request.simNumber,
             timeoutSeconds = request.timeoutSeconds ?: DEFAULT_TIMEOUT_SECONDS,
         )
@@ -84,57 +76,6 @@ class UssdService(
     }
 
     fun get(id: String): UssdSession? = sessions[id]
-
-    // ── Écrans (appelé par UssdAccessibilityService) ─────────────────────────
-
-    /**
-     * Décide quoi faire de l'écran affiché. [hasInput] : l'écran attend une saisie (menu).
-     * Règles : une étape par écran de saisie, et seulement si l'écran contient le texte attendu ;
-     * la session réussit si toutes les étapes sont faites ET qu'un écran sans saisie (message final) suit.
-     */
-    fun onScreen(text: String, hasInput: Boolean): UssdAction {
-        val session = current ?: return UssdAction.Ignore
-        if (session.state != UssdState.Running) return UssdAction.Ignore
-        if (text.isBlank() || text == lastScreen) return UssdAction.Ignore
-        if (isProgressScreen(text)) return UssdAction.Ignore
-
-        lastScreen = text
-        session.screens.add(text)
-        val remaining = session.steps.size - session.stepsDone
-
-        return when {
-            hasInput && remaining > 0 -> {
-                val step = session.steps[session.stepsDone]
-                if (!screenMatches(text, step.expect)) {
-                    finish(
-                        session, UssdState.Failed, finalMessage = text,
-                        error = "Écran inattendu à l'étape ${session.stepsDone + 1} (attendu : « ${step.expect} »). Rien n'a été saisi."
-                    )
-                    return UssdAction.Dismiss
-                }
-                session.stepsDone++
-                UssdAction.Reply(step.answer!!.replace(PIN_PLACEHOLDER, settings.pin ?: ""))
-            }
-
-            hasInput -> {
-                finish(session, UssdState.Failed, finalMessage = text, error = "Menu inattendu : plus aucune étape prévue.")
-                UssdAction.Dismiss
-            }
-
-            remaining > 0 -> {
-                finish(
-                    session, UssdState.Failed, finalMessage = text,
-                    error = "Session terminée par l'opérateur à l'étape ${session.stepsDone + 1}."
-                )
-                UssdAction.Dismiss
-            }
-
-            else -> {
-                finish(session, UssdState.Completed, finalMessage = text)
-                UssdAction.Dismiss
-            }
-        }
-    }
 
     // ── Exécution ────────────────────────────────────────────────────────────
 
@@ -147,64 +88,85 @@ class UssdService(
 
         session.state = UssdState.Running
         session.startedAt = Date()
-        lastScreen = null
-        current = session
-
         try {
             settings.markDialed(session.id)
-            withContext(Dispatchers.Main) { dial(session) }
-
-            val ended = withTimeoutOrNull(session.timeoutSeconds * 1000L) { session.done.await() }
-            if (ended == null) {
-                finish(
-                    session, UssdState.Failed,
-                    error = "Délai dépassé (${session.timeoutSeconds} s) : se fier au SMS de l'opérateur."
+            val outcome = withTimeoutOrNull(session.timeoutSeconds * 1000L) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) send(session) else Outcome.Failure(UNSUPPORTED)
+            }
+            when (outcome) {
+                null -> finish(session, UssdState.Failed, error = "Pas de réponse de l'opérateur en ${session.timeoutSeconds} s.")
+                is Outcome.Response -> finish(session, UssdState.Completed, response = outcome.text)
+                is Outcome.Failure -> finish(
+                    session, UssdState.Failed, failureCode = outcome.code,
+                    error = "Échec USSD renvoyé par le téléphone (code ${outcome.code})."
                 )
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Session ${session.id} en échec", e)
-            finish(session, UssdState.Failed, error = e.message ?: e.javaClass.simpleName)
-        } finally {
-            current = null
+            // Jamais e.message brut : il pourrait contenir le code composé, donc le PIN.
+            Log.e(TAG, "Session ${session.id} en échec : ${e.javaClass.simpleName}")
+            finish(session, UssdState.Failed, error = e.javaClass.simpleName)
         }
     }
 
-    private fun dial(session: UssdSession) {
-        val intent = Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(session.code)))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        phoneAccountFor(session.simNumber)?.let {
-            intent.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, it)
-        }
-        // Lancement depuis l'arrière-plan autorisé : le service d'accessibilité actif en exempte l'application.
-        context.startActivity(intent)
+    private sealed class Outcome {
+        class Response(val text: String) : Outcome()
+        class Failure(val code: Int) : Outcome()
     }
 
-    @SuppressLint("MissingPermission") // READ_PHONE_STATE vérifiée dans checkReadiness
-    private fun phoneAccountFor(simNumber: Int?): PhoneAccountHandle? {
-        if (simNumber == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
-        val telecom = context.getSystemService(TelecomManager::class.java)
-        return telecom.callCapablePhoneAccounts.getOrNull(simNumber - 1)
+    /** Le PIN n'existe que dans cette fonction, le temps de l'appel. */
+    @SuppressLint("MissingPermission") // CALL_PHONE vérifiée dans checkReadiness
+    @RequiresApi(Build.VERSION_CODES.O)
+    private suspend fun send(session: UssdSession): Outcome = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { continuation ->
+            val dialed = session.code.replace(PIN_PLACEHOLDER, settings.pin ?: "")
+            telephonyFor(session.simNumber).sendUssdRequest(
+                dialed,
+                object : TelephonyManager.UssdResponseCallback() {
+                    override fun onReceiveUssdResponse(
+                        telephonyManager: TelephonyManager, request: String, response: CharSequence
+                    ) {
+                        if (continuation.isActive) continuation.resume(Outcome.Response(response.toString()))
+                    }
+
+                    override fun onReceiveUssdResponseFailed(
+                        telephonyManager: TelephonyManager, request: String, failureCode: Int
+                    ) {
+                        if (continuation.isActive) continuation.resume(Outcome.Failure(failureCode))
+                    }
+                },
+                Handler(Looper.getMainLooper())
+            )
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    @RequiresApi(Build.VERSION_CODES.O)
+    private fun telephonyFor(simNumber: Int?): TelephonyManager {
+        val telephony = context.getSystemService(TelephonyManager::class.java)
+        if (simNumber == null) return telephony
+        val subscriptionId = SubscriptionsHelper.getSubscriptionId(context, simNumber - 1)
             ?: throw IllegalArgumentException("SIM $simNumber introuvable sur ce téléphone.")
+        return telephony.createForSubscriptionId(subscriptionId)
     }
 
     @Synchronized
     private fun finish(
         session: UssdSession,
         state: UssdState,
-        finalMessage: String? = null,
+        response: String? = null,
         error: String? = null,
+        failureCode: Int? = null,
     ) {
         if (session.isFinished) return
 
         session.state = state
-        session.finalMessage = finalMessage
+        session.response = response
         session.error = error
+        session.failureCode = failureCode
         session.finishedAt = Date()
-        session.done.complete(Unit)
 
         val event = if (state == UssdState.Completed) WebHookEvent.UssdCompleted else WebHookEvent.UssdFailed
         val payload = session.toResponse()
-        // Hors du fil principal : emit() interroge la base des webhooks.
         scope.launch {
             try {
                 webHooksService.emit(context, event, payload)
@@ -220,22 +182,17 @@ class UssdService(
     private fun validateRequest(request: UssdRequest): String {
         val code = request.code?.trim()
         require(!code.isNullOrEmpty()) { "code est obligatoire." }
-        require(CODE_REGEX.matches(code)) { "code invalide : chiffres, * et # uniquement, terminé par #." }
+        val pinCount = code.split(PIN_PLACEHOLDER).size - 1
+        require(pinCount <= 1) { "code : $PIN_PLACEHOLDER au plus une fois." }
+        require(CODE_REGEX.matches(code.replace(PIN_PLACEHOLDER, ""))) {
+            "code invalide : chiffres, * et # uniquement (plus $PIN_PLACEHOLDER), terminé par #."
+        }
+        if (pinCount == 1) {
+            require(settings.pin != null) { "Code PIN non réglé sur le téléphone (Paramètres > USSD)." }
+        }
 
         val id = request.id?.trim()?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
         require(ID_REGEX.matches(id)) { "id invalide : 1 à 64 caractères parmi A-Z, a-z, 0-9, - et _." }
-
-        val steps = request.steps ?: emptyList()
-        require(steps.size <= MAX_STEPS) { "Au plus $MAX_STEPS étapes." }
-        steps.forEachIndexed { index, step ->
-            val answer = step.answer
-            require(!answer.isNullOrBlank()) { "steps[$index].answer est vide." }
-            require(answer.length <= MAX_ANSWER_LENGTH) { "steps[$index].answer dépasse $MAX_ANSWER_LENGTH caractères." }
-            step.expect?.let { require(it.isNotBlank()) { "steps[$index].expect est vide : l'omettre ou le remplir." } }
-        }
-        if (steps.any { it.answer!!.contains(PIN_PLACEHOLDER) }) {
-            require(settings.pin != null) { "Code PIN non réglé sur le téléphone (Paramètres > USSD)." }
-        }
 
         request.simNumber?.let { require(it >= 1) { "simNumber commence à 1." } }
         request.timeoutSeconds?.let {
@@ -248,37 +205,20 @@ class UssdService(
 
     /** Ce qui empêcherait la session d'aboutir, vérifié juste avant de composer. */
     private fun checkReadiness(session: UssdSession): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return "USSD en une commande indisponible : Android 8 ou plus requis."
+        }
         if (!hasPermission(Manifest.permission.CALL_PHONE)) {
             return "Permission CALL_PHONE refusée sur le téléphone."
         }
         if (session.simNumber != null && !hasPermission(Manifest.permission.READ_PHONE_STATE)) {
             return "Permission READ_PHONE_STATE refusée : impossible de choisir la SIM."
         }
-        if (!UssdAccessibilityService.isConnected) {
-            return "Service d'accessibilité USSD désactivé (Paramètres Android > Accessibilité)."
-        }
         return null
     }
 
-    /** L'écran contient-il le texte attendu ? Casse, accents et espaces (retours à la ligne compris) ignorés. */
-    private fun screenMatches(screen: String, expect: String?): Boolean =
-        expect == null || normalize(screen).contains(normalize(expect))
-
-    private fun normalize(value: String): String =
-        Normalizer.normalize(value, Normalizer.Form.NFD)
-            .replace(DIACRITICS_REGEX, "")
-            .lowercase()
-            .replace(WHITESPACE_REGEX, " ")
-            .trim()
-
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
-
-    /** Boîte « Code USSD en cours… » affichée entre deux écrans : ce n'est pas une réponse de l'opérateur. */
-    private fun isProgressScreen(text: String): Boolean {
-        val lower = text.lowercase()
-        return lower.contains("ussd") && PROGRESS_WORDS.any { lower.contains(it) }
-    }
 
     /** Garde la mémoire bornée : les sessions terminées les plus anciennes sont oubliées. */
     private fun purgeFinishedSessions() {
@@ -295,17 +235,15 @@ class UssdService(
 
         const val PIN_PLACEHOLDER = "{PIN}"
 
-        private const val DEFAULT_TIMEOUT_SECONDS = 90
+        /** Android trop ancien (vérifié aussi dans checkReadiness). */
+        private const val UNSUPPORTED = -100
+
+        private const val DEFAULT_TIMEOUT_SECONDS = 60
         private const val MIN_TIMEOUT_SECONDS = 10
-        private const val MAX_TIMEOUT_SECONDS = 300
-        private const val MAX_STEPS = 15
-        private const val MAX_ANSWER_LENGTH = 160
+        private const val MAX_TIMEOUT_SECONDS = 180
         private const val MAX_SESSIONS_IN_MEMORY = 200
 
         private val CODE_REGEX = Regex("^[0-9*#]+#$")
         private val ID_REGEX = Regex("^[A-Za-z0-9_-]{1,64}$")
-        private val DIACRITICS_REGEX = Regex("\\p{Mn}+")
-        private val WHITESPACE_REGEX = Regex("\\s+")
-        private val PROGRESS_WORDS = listOf("cours", "running", "exécution", "execution")
     }
 }

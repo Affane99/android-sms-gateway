@@ -1,85 +1,48 @@
 # Module USSD (fork)
 
-Ajout à SMS Gateway for Android : exécuter des codes USSD à plusieurs écrans (menus Mobile Money)
-à la demande de l'API locale. Tout le code est dans `modules/ussd/` et `localserver/routes/UssdRoutes.kt`.
+Ajout à SMS Gateway for Android : composer un code USSD **complet en une seule fois** à la demande de
+l'API locale, avec `TelephonyManager.sendUssdRequest` (Android 8 ou plus). Aucune boîte ne s'affiche,
+aucun service d'accessibilité n'est nécessaire. Code : `modules/ussd/` et `localserver/routes/UssdRoutes.kt`.
 
-## Principe
-
-1. Le serveur envoie `POST /ussd` avec le code et les étapes : pour chaque écran, le texte attendu et la réponse.
-2. Le téléphone compose le code. Le service d'accessibilité lit chaque boîte USSD, vérifie qu'elle contient
-   le texte attendu, puis saisit la réponse. Un écran inattendu annule la session sans rien saisir.
-3. En fin de session, le webhook `ussd:completed` ou `ussd:failed` part avec les textes affichés.
-
-**Le téléphone ne confirme aucun transfert.** La preuve reste le SMS de l'opérateur
-(« Envoi de … vers le … »), analysé par le serveur. Un `ussd:failed`, en particulier après un
-délai dépassé, ne prouve pas que l'argent n'est pas parti.
+Le téléphone ne décide rien : le serveur (Void Gate) fournit le code, vérifie la réponse de l'opérateur,
+et seule la preuve de l'opérateur (SMS « Envoi de ») confirme un mouvement d'argent. Les codes vivent
+côté serveur : si l'opérateur change son menu, on corrige le serveur, sans recompiler l'application.
 
 ## API
 
 `POST /ussd` (authentification Basic de l'API locale) :
 
-Exemple : transfert national Orange Money Guinée de 20 000 GNF vers le 627023108 (menu relevé le 22/11/2026).
-
 ```json
-{
-  "id": "transfert-2026-000123",
-  "code": "*144#",
-  "steps": [
-    { "expect": "Bienvenue sur Orange Money", "answer": "1" },
-    { "expect": "Transfert National", "answer": "1" },
-    { "expect": "numero de telephone du beneficiaire", "answer": "627023108" },
-    { "expect": "montant que vous souhaitez transferer", "answer": "20000" },
-    { "expect": "frais de retrait", "answer": "1" },
-    { "expect": "Vous transferez 20000 GNF vers le 627023108", "answer": "1" },
-    { "expect": "code secret", "answer": "{PIN}" }
-  ],
-  "simNumber": 1,
-  "timeoutSeconds": 90
-}
+{ "id": "trf-000123-x", "code": "*144*1*1*627023108*1000*1*1*{PIN}#", "simNumber": 1, "timeoutSeconds": 60 }
 ```
-
-L'étape 6 est la protection essentielle : le récapitulatif n'est confirmé que s'il contient
-le montant ET le numéro exacts. À l'étape 5, `1` = Non (le bénéficiaire paie ses frais de retrait).
 
 | Champ | Règle |
 |---|---|
 | `id` | Clé d'idempotence, 1 à 64 caractères `A-Za-z0-9_-`. Absent : généré. |
-| `code` | Chiffres, `*` et `#`, terminé par `#`. |
-| `steps` | Un élément par écran de saisie, 15 au plus. |
-| `steps[].expect` | Texte que l'écran doit contenir (casse, accents et espaces ignorés). Facultatif, mais obligatoire en pratique pour un transfert. |
-| `steps[].answer` | Réponse saisie. `{PIN}` est remplacé sur le téléphone. |
+| `code` | Chiffres, `*` et `#`, terminé par `#`, plus `{PIN}` au plus une fois. |
 | `simNumber` | 1, 2… Absent : SIM par défaut. |
-| `timeoutSeconds` | 10 à 300, défaut 90. |
+| `timeoutSeconds` | 10 à 180, défaut 60. |
 
-Réponses :
-- `202` : session en file, avec son état.
-- `400` : requête invalide (message explicite).
-- `409` : `id` déjà composé, mais son état a été perdu (redémarrage). Ne jamais renvoyer avec un autre id avant d'avoir vérifié le SMS.
+`{PIN}` est remplacé sur le téléphone par le code réglé dans Paramètres > USSD, au moment de composer.
+Le PIN n'est ni reçu par l'API, ni stocké dans la session, ni journalisé.
 
-`GET /ussd/{id}` : état de la session (`Pending`, `Running`, `Completed`, `Failed`), écrans affichés,
-message final, erreur. `404` si la session est inconnue depuis le dernier démarrage de l'application.
+Réponses : `202` session en file ; `400` requête invalide ; `409` id déjà composé mais état perdu
+(redémarrage) : ne jamais renvoyer avec un autre id avant d'avoir vérifié le SMS.
 
-Webhooks : enregistrer `ussd:completed` et `ussd:failed` comme les autres événements (`POST /webhooks`).
-Le contenu est le même objet que `GET /ussd/{id}`.
+`GET /ussd/{id}` : état (`Pending`, `Running`, `Completed`, `Failed`), `response` (texte de l'opérateur),
+`error`, `failureCode`. `404` si inconnue depuis le dernier démarrage.
 
-## Règles de la session
+Webhooks : `ussd:completed` (réponse reçue) et `ussd:failed`, même contenu que `GET /ussd/{id}`.
+
+## Règles
 
 - Une session à la fois, les suivantes attendent en file.
-- Un écran de saisie qui contient le texte attendu reçoit la réponse de l'étape.
-- Un écran de saisie qui ne le contient pas : session annulée sans rien saisir, `ussd:failed`.
-- Un écran de saisie alors qu'il ne reste aucune étape : session annulée, `ussd:failed`.
-- Un écran sans saisie avant la dernière étape (erreur de l'opérateur) : `ussd:failed`, le texte est dans `finalMessage`.
-- Un écran sans saisie après la dernière étape : `ussd:completed`.
-- Un id composé est enregistré AVANT de composer : il n'est jamais recomposé, même après redémarrage.
+- Un id est enregistré AVANT de composer : il n'est jamais recomposé, même après redémarrage.
+- `Completed` veut seulement dire que l'opérateur a répondu : c'est au serveur de lire `response`.
 
 ## Mise en service du téléphone
 
-1. Installer l'APK et accorder les permissions demandées, dont **Appels téléphoniques**.
-2. Android 13 et plus : Paramètres > Applications > SMS Gateway > menu ⋮ > **Autoriser les paramètres restreints**.
-3. Paramètres Android > Accessibilité > **SMS Gateway USSD** : activer.
-4. Dans l'application : Paramètres > USSD > **Code PIN Mobile Money**. Il reste sur le téléphone et n'est pas exporté par `/settings`.
-5. Désactiver l'optimisation de batterie (Paramètres de l'application > Système).
-
-Les boîtes USSD sont attendues dans le paquet `com.android.phone`. Si un téléphone en utilise un autre,
-le changer dans `res/xml/ussd_accessibility_service.xml` ET dans `USSD_PACKAGE`
-(`UssdAccessibilityService.kt`). Seules les fenêtres de ce paquet sont lues.
+1. Android 8 ou plus. Installer l'APK et accorder les permissions, dont **Appels téléphoniques**.
+2. Dans l'application : Paramètres > USSD > **Code PIN Mobile Money**. Il reste sur le téléphone et n'est
+   pas exporté par `/settings`.
+3. Désactiver l'optimisation de batterie pour l'application.
