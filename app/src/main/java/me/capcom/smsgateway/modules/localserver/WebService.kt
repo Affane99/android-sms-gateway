@@ -178,6 +178,10 @@ class WebService : Service() {
                         }
                     }
 
+                    route("/ussd") {
+                        me.capcom.smsgateway.modules.localserver.routes.UssdRoutes(get())
+                            .register(this)
+                    }
                     route("/logs") {
                         LogsRoutes(get()).register(this)
                     }

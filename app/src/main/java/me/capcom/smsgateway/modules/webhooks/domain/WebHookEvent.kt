@@ -43,7 +43,13 @@ enum class WebHookEvent(val value: String) {
     AppStarted("app:started"),
 
     @SerializedName("sms:cancelled")
-    SmsCancelled("sms:cancelled");
+    SmsCancelled("sms:cancelled"),
+
+    @SerializedName("ussd:completed")
+    UssdCompleted("ussd:completed"),
+
+    @SerializedName("ussd:failed")
+    UssdFailed("ussd:failed");
 
     fun batchEvent(): WebHookEvent = when (this) {
         SmsReceived -> SmsBatchReceived

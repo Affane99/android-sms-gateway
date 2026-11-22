@@ -86,6 +86,11 @@
     <string name="period">Period</string>
     <string name="ping_service_is_active">Ping service is active</string>
     <string name="ping">Ping</string>
+    <string name="ussd">USSD</string>
+    <string name="ussd_pin">Code PIN Mobile Money</string>
+    <string name="ussd_pin_summary">Stocké sur ce téléphone uniquement, jamais transmis par l\'API</string>
+    <string name="ussd_accessibility_label">SMS Gateway USSD</string>
+    <string name="ussd_accessibility_description">Lit les menus USSD de l\'opérateur et y répond pour les sessions demandées par l\'API. Inactif hors de ces sessions.</string>
     <string name="please_enter_one_time_code_displayed_on_already_registered_device">Please enter
         the one-time code displayed on the already-registered device</string>
     <string name="port_credentials_etc">Port, credentials, etc.</string>

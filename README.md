@@ -1,5 +1,7 @@
 <a name="readme-top"></a>
 
+> **Fork** de [capcom6/android-sms-gateway](https://github.com/capcom6/android-sms-gateway) (Apache 2.0), modifié par Affane99 : ajout d'un module USSD pour les menus Mobile Money. Voir [docs/USSD.md](docs/USSD.md).
+
 <!-- PROJECT SHIELDS -->
 [![Contributors][contributors-shield]][contributors-url]
 [![Forks][forks-shield]][forks-url]
