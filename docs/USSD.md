@@ -18,19 +18,15 @@ délai dépassé, ne prouve pas que l'argent n'est pas parti.
 
 `POST /ussd` (authentification Basic de l'API locale) :
 
-Exemple : transfert national Orange Money Guinée de 20 000 GNF vers le 627023108 (menu relevé le 22/11/2026).
+Exemple : transfert national Orange Money Guinée de 1 000 GNF vers le 627023108. Le code de départ
+mène directement au récapitulatif ; une seule session, PIN compris.
 
 ```json
 {
-  "id": "transfert-2026-000123",
-  "code": "*144#",
+  "id": "0f8fad5bd9cb469fa16570867728950e",
+  "code": "*144*1*1*627023108*1000*1#",
   "steps": [
-    { "expect": "Bienvenue sur Orange Money", "answer": "1" },
-    { "expect": "Transfert National", "answer": "1" },
-    { "expect": "numero de telephone du beneficiaire", "answer": "627023108" },
-    { "expect": "montant que vous souhaitez transferer", "answer": "20000" },
-    { "expect": "frais de retrait", "answer": "1" },
-    { "expect": "Vous transferez 20000 GNF vers le 627023108", "answer": "1" },
+    { "expect": "Vous transferez 1000 GNF vers le 627023108", "answer": "1" },
     { "expect": "code secret", "answer": "{PIN}" }
   ],
   "simNumber": 1,
@@ -38,8 +34,8 @@ Exemple : transfert national Orange Money Guinée de 20 000 GNF vers le 62702310
 }
 ```
 
-L'étape 6 est la protection essentielle : le récapitulatif n'est confirmé que s'il contient
-le montant ET le numéro exacts. À l'étape 5, `1` = Non (le bénéficiaire paie ses frais de retrait).
+L'étape 1 est la protection essentielle : le récapitulatif n'est confirmé que s'il contient
+le montant ET le numéro exacts. Sinon la session est annulée sans rien saisir.
 
 | Champ | Règle |
 |---|---|
