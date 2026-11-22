@@ -81,4 +81,5 @@ Le contenu est le même objet que `GET /ussd/{id}`.
 5. Désactiver l'optimisation de batterie (Paramètres de l'application > Système).
 
 Les boîtes USSD sont attendues dans le paquet `com.android.phone`. Si un téléphone en utilise un autre,
-il apparaît dans les logs `UssdAccessibility` ; l'ajouter dans `res/xml/ussd_accessibility_service.xml`.
+le changer dans `res/xml/ussd_accessibility_service.xml` ET dans `USSD_PACKAGE`
+(`UssdAccessibilityService.kt`). Seules les fenêtres de ce paquet sont lues.

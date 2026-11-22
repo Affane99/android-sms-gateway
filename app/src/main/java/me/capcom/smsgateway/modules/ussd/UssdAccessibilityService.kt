@@ -32,7 +32,7 @@ class UssdAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         if (ussdService.current == null) return
-        val root = rootInActiveWindow ?: return
+        val root = ussdWindowRoot(event) ?: return
 
         val screen = Screen()
         readScreen(root, screen)
@@ -49,6 +49,22 @@ class UssdAccessibilityService : AccessibilityService() {
             }
             UssdAction.Dismiss -> clickButton(screen.buttons, DISMISS_LABELS, preferLast = false)
         }
+    }
+
+    /**
+     * Racine de la fenêtre qui a produit l'événement, seulement si elle appartient au paquet USSD.
+     * Surtout pas rootInActiveWindow : entre deux écrans USSD, la fenêtre active redevient
+     * brièvement l'application au premier plan (SMS Gateway elle-même), qui serait lue comme un écran.
+     */
+    private fun ussdWindowRoot(event: AccessibilityEvent): AccessibilityNodeInfo? {
+        val eventPackage = event.packageName?.toString() ?: return null
+        if (eventPackage != USSD_PACKAGE) return null
+
+        var node = event.source ?: return null
+        while (true) {
+            node = node.parent ?: break
+        }
+        return node.takeIf { it.packageName?.toString() == USSD_PACKAGE }
     }
 
     private class Screen {
@@ -93,6 +109,9 @@ class UssdAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "UssdAccessibility"
+
+        /** Paquet qui affiche les boîtes USSD ; doit rester égal à packageNames de ussd_accessibility_service.xml. */
+        private const val USSD_PACKAGE = "com.android.phone"
 
         /** Lu par UssdService avant de composer. */
         @Volatile
