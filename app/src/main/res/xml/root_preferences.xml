@@ -52,6 +52,14 @@
             app:useSimpleSummaryProvider="true" />
     </PreferenceCategory>
 
+    <PreferenceCategory app:title="@string/ussd">
+        <EditTextPreference
+            app:icon="@drawable/ic_encryption"
+            app:key="ussd.pin"
+            app:summary="@string/ussd_pin_summary"
+            app:title="@string/ussd_pin" />
+    </PreferenceCategory>
+
     <PreferenceCategory app:title="@string/logs">
         <Preference
             app:fragment="me.capcom.smsgateway.ui.LogsListFragment"

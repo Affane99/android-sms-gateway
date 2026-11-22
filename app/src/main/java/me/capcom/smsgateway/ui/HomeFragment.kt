@@ -411,6 +411,7 @@ class HomeFragment : Fragment() {
                 Manifest.permission.RECEIVE_SMS,
                 Manifest.permission.SEND_SMS,
                 Manifest.permission.RECEIVE_MMS,
+                Manifest.permission.CALL_PHONE,
                 Manifest.permission.READ_PHONE_NUMBERS.takeIf { Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU },
             )
                 .filterNotNull()

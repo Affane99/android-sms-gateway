@@ -59,6 +59,7 @@ class App: Application() {
                 connectionModule,
                 orchestratorModule,
                 deviceModule,
+                me.capcom.smsgateway.modules.ussd.ussdModule,
             )
         }
 
