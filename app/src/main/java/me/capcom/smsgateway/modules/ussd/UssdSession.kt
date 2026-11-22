@@ -1,5 +1,7 @@
 package me.capcom.smsgateway.modules.ussd
 
+import kotlinx.coroutines.CompletableDeferred
+import java.util.Collections
 import java.util.Date
 
 enum class UssdState { Pending, Running, Completed, Failed }
@@ -9,23 +11,35 @@ enum class UssdState { Pending, Running, Completed, Failed }
  * un champ absent arriverait null malgré un type non nullable.
  *
  * - id : clé d'idempotence fournie par le serveur. Un id déjà composé n'est JAMAIS recomposé.
- * - code : code complet à composer en une fois, ex. "*144*1*1*627023108*1000*1*1*{PIN}#".
- *   "{PIN}" est remplacé sur le téléphone par le code PIN réglé dans l'application : il ne
- *   transite jamais par l'API et n'est jamais stocké dans la session.
+ * - code : code à composer, ex. "*144#".
+ * - steps : un élément par écran de saisie, dans l'ordre (cf. [UssdStep]).
  * - simNumber : SIM à utiliser (1, 2…). Absent : SIM par défaut du téléphone.
- * - timeoutSeconds : attente maximale de la réponse de l'opérateur (défaut 60 s).
+ * - timeoutSeconds : durée maximale de la session (défaut 90 s).
  */
 data class UssdRequest(
     val id: String?,
     val code: String?,
+    val steps: List<UssdStep>?,
     val simNumber: Int?,
     val timeoutSeconds: Int?,
 )
 
+/**
+ * Un écran de saisie.
+ * - expect : texte que l'écran DOIT contenir pour qu'on réponde (casse, accents et espaces ignorés).
+ *   Sinon la session est annulée sans rien saisir. Facultatif, mais indispensable pour tout transfert.
+ * - answer : ce qu'on saisit. "{PIN}" est remplacé sur le téléphone par le PIN réglé dans
+ *   l'application (il ne transite jamais par l'API).
+ */
+data class UssdStep(
+    val expect: String?,
+    val answer: String?,
+)
+
 class UssdSession(
     val id: String,
-    /** Code tel que reçu : contient "{PIN}", jamais le PIN lui-même. */
     val code: String,
+    val steps: List<UssdStep>,
     val simNumber: Int?,
     val timeoutSeconds: Int,
 ) {
@@ -34,22 +48,25 @@ class UssdSession(
     @Volatile
     var state: UssdState = UssdState.Pending
 
-    /** Texte renvoyé par l'opérateur. */
+    /** Textes des écrans affichés par l'opérateur, dans l'ordre (jamais ce qui a été saisi). */
+    val screens: MutableList<String> = Collections.synchronizedList(mutableListOf())
+
     @Volatile
-    var response: String? = null
+    var stepsDone: Int = 0
+
+    @Volatile
+    var finalMessage: String? = null
 
     @Volatile
     var error: String? = null
-
-    /** Code d'échec Android (TelephonyManager.USSD_RETURN_FAILURE = -1, USSD_ERROR_SERVICE_UNAVAIL = -2). */
-    @Volatile
-    var failureCode: Int? = null
 
     @Volatile
     var startedAt: Date? = null
 
     @Volatile
     var finishedAt: Date? = null
+
+    internal val done = CompletableDeferred<Unit>()
 
     val isFinished: Boolean
         get() = state == UssdState.Completed || state == UssdState.Failed
@@ -59,9 +76,11 @@ class UssdSession(
         state = state,
         code = code,
         simNumber = simNumber,
-        response = response,
+        stepsDone = stepsDone,
+        stepsTotal = steps.size,
+        screens = screens.toList(),
+        finalMessage = finalMessage,
         error = error,
-        failureCode = failureCode,
         createdAt = createdAt,
         startedAt = startedAt,
         finishedAt = finishedAt,
@@ -74,10 +93,19 @@ data class UssdSessionResponse(
     val state: UssdState,
     val code: String,
     val simNumber: Int?,
-    val response: String?,
+    val stepsDone: Int,
+    val stepsTotal: Int,
+    val screens: List<String>,
+    val finalMessage: String?,
     val error: String?,
-    val failureCode: Int?,
     val createdAt: Date,
     val startedAt: Date?,
     val finishedAt: Date?,
 )
+
+/** Action que le service d'accessibilité doit faire sur l'écran USSD affiché. */
+sealed class UssdAction {
+    object Ignore : UssdAction()
+    class Reply(val text: String) : UssdAction()
+    object Dismiss : UssdAction()
+}
