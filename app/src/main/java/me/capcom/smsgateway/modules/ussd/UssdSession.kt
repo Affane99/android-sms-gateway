@@ -12,23 +12,34 @@ enum class UssdState { Pending, Running, Completed, Failed }
  *
  * - id : clé d'idempotence fournie par le serveur. Un id déjà composé n'est JAMAIS recomposé.
  * - code : code à composer, ex. "*144#".
- * - answers : réponses à saisir, une par écran de menu, dans l'ordre. "{PIN}" est remplacé
- *   sur le téléphone par le code PIN réglé dans l'application (il ne transite jamais par l'API).
+ * - steps : un élément par écran de saisie, dans l'ordre (cf. [UssdStep]).
  * - simNumber : SIM à utiliser (1, 2…). Absent : SIM par défaut du téléphone.
  * - timeoutSeconds : durée maximale de la session (défaut 90 s).
  */
 data class UssdRequest(
     val id: String?,
     val code: String?,
-    val answers: List<String>?,
+    val steps: List<UssdStep>?,
     val simNumber: Int?,
     val timeoutSeconds: Int?,
+)
+
+/**
+ * Un écran de saisie.
+ * - expect : texte que l'écran DOIT contenir pour qu'on réponde (casse, accents et espaces ignorés).
+ *   Sinon la session est annulée sans rien saisir. Facultatif, mais indispensable pour tout transfert.
+ * - answer : ce qu'on saisit. "{PIN}" est remplacé sur le téléphone par le PIN réglé dans
+ *   l'application (il ne transite jamais par l'API).
+ */
+data class UssdStep(
+    val expect: String?,
+    val answer: String?,
 )
 
 class UssdSession(
     val id: String,
     val code: String,
-    val answers: List<String>,
+    val steps: List<UssdStep>,
     val simNumber: Int?,
     val timeoutSeconds: Int,
 ) {
@@ -41,7 +52,7 @@ class UssdSession(
     val screens: MutableList<String> = Collections.synchronizedList(mutableListOf())
 
     @Volatile
-    var answersSent: Int = 0
+    var stepsDone: Int = 0
 
     @Volatile
     var finalMessage: String? = null
@@ -65,8 +76,8 @@ class UssdSession(
         state = state,
         code = code,
         simNumber = simNumber,
-        answersSent = answersSent,
-        answersTotal = answers.size,
+        stepsDone = stepsDone,
+        stepsTotal = steps.size,
         screens = screens.toList(),
         finalMessage = finalMessage,
         error = error,
@@ -82,8 +93,8 @@ data class UssdSessionResponse(
     val state: UssdState,
     val code: String,
     val simNumber: Int?,
-    val answersSent: Int,
-    val answersTotal: Int,
+    val stepsDone: Int,
+    val stepsTotal: Int,
     val screens: List<String>,
     val finalMessage: String?,
     val error: String?,

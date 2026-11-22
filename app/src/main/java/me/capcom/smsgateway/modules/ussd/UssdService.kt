@@ -20,6 +20,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import me.capcom.smsgateway.modules.webhooks.WebHooksService
 import me.capcom.smsgateway.modules.webhooks.domain.WebHookEvent
+import java.text.Normalizer
 import java.util.Date
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -72,7 +73,7 @@ class UssdService(
         val session = UssdSession(
             id = id,
             code = request.code!!.trim(),
-            answers = request.answers ?: emptyList(),
+            steps = request.steps ?: emptyList(),
             simNumber = request.simNumber,
             timeoutSeconds = request.timeoutSeconds ?: DEFAULT_TIMEOUT_SECONDS,
         )
@@ -88,8 +89,8 @@ class UssdService(
 
     /**
      * Décide quoi faire de l'écran affiché. [hasInput] : l'écran attend une saisie (menu).
-     * Règle : une réponse par écran de saisie ; la session réussit seulement si toutes les
-     * réponses ont été données ET qu'un écran sans saisie (message final) suit.
+     * Règles : une étape par écran de saisie, et seulement si l'écran contient le texte attendu ;
+     * la session réussit si toutes les étapes sont faites ET qu'un écran sans saisie (message final) suit.
      */
     fun onScreen(text: String, hasInput: Boolean): UssdAction {
         val session = current ?: return UssdAction.Ignore
@@ -99,25 +100,31 @@ class UssdService(
 
         lastScreen = text
         session.screens.add(text)
-        val remaining = session.answers.size - session.answersSent
+        val remaining = session.steps.size - session.stepsDone
 
         return when {
             hasInput && remaining > 0 -> {
-                val answer = session.answers[session.answersSent]
-                    .replace(PIN_PLACEHOLDER, settings.pin ?: "")
-                session.answersSent++
-                UssdAction.Reply(answer)
+                val step = session.steps[session.stepsDone]
+                if (!screenMatches(text, step.expect)) {
+                    finish(
+                        session, UssdState.Failed, finalMessage = text,
+                        error = "Écran inattendu à l'étape ${session.stepsDone + 1} (attendu : « ${step.expect} »). Rien n'a été saisi."
+                    )
+                    return UssdAction.Dismiss
+                }
+                session.stepsDone++
+                UssdAction.Reply(step.answer!!.replace(PIN_PLACEHOLDER, settings.pin ?: ""))
             }
 
             hasInput -> {
-                finish(session, UssdState.Failed, error = "Menu inattendu : plus aucune réponse prévue.")
+                finish(session, UssdState.Failed, finalMessage = text, error = "Menu inattendu : plus aucune étape prévue.")
                 UssdAction.Dismiss
             }
 
             remaining > 0 -> {
                 finish(
                     session, UssdState.Failed, finalMessage = text,
-                    error = "Session terminée par l'opérateur avant la fin des réponses."
+                    error = "Session terminée par l'opérateur à l'étape ${session.stepsDone + 1}."
                 )
                 UssdAction.Dismiss
             }
@@ -218,13 +225,15 @@ class UssdService(
         val id = request.id?.trim()?.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
         require(ID_REGEX.matches(id)) { "id invalide : 1 à 64 caractères parmi A-Z, a-z, 0-9, - et _." }
 
-        val answers = request.answers ?: emptyList()
-        require(answers.size <= MAX_ANSWERS) { "Au plus $MAX_ANSWERS réponses." }
-        answers.forEachIndexed { index, answer ->
-            require(answer.isNotBlank()) { "answers[$index] est vide." }
-            require(answer.length <= MAX_ANSWER_LENGTH) { "answers[$index] dépasse $MAX_ANSWER_LENGTH caractères." }
+        val steps = request.steps ?: emptyList()
+        require(steps.size <= MAX_STEPS) { "Au plus $MAX_STEPS étapes." }
+        steps.forEachIndexed { index, step ->
+            val answer = step.answer
+            require(!answer.isNullOrBlank()) { "steps[$index].answer est vide." }
+            require(answer.length <= MAX_ANSWER_LENGTH) { "steps[$index].answer dépasse $MAX_ANSWER_LENGTH caractères." }
+            step.expect?.let { require(it.isNotBlank()) { "steps[$index].expect est vide : l'omettre ou le remplir." } }
         }
-        if (answers.any { it.contains(PIN_PLACEHOLDER) }) {
+        if (steps.any { it.answer!!.contains(PIN_PLACEHOLDER) }) {
             require(settings.pin != null) { "Code PIN non réglé sur le téléphone (Paramètres > USSD)." }
         }
 
@@ -250,6 +259,17 @@ class UssdService(
         }
         return null
     }
+
+    /** L'écran contient-il le texte attendu ? Casse, accents et espaces (retours à la ligne compris) ignorés. */
+    private fun screenMatches(screen: String, expect: String?): Boolean =
+        expect == null || normalize(screen).contains(normalize(expect))
+
+    private fun normalize(value: String): String =
+        Normalizer.normalize(value, Normalizer.Form.NFD)
+            .replace(DIACRITICS_REGEX, "")
+            .lowercase()
+            .replace(WHITESPACE_REGEX, " ")
+            .trim()
 
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
@@ -278,12 +298,14 @@ class UssdService(
         private const val DEFAULT_TIMEOUT_SECONDS = 90
         private const val MIN_TIMEOUT_SECONDS = 10
         private const val MAX_TIMEOUT_SECONDS = 300
-        private const val MAX_ANSWERS = 15
+        private const val MAX_STEPS = 15
         private const val MAX_ANSWER_LENGTH = 160
         private const val MAX_SESSIONS_IN_MEMORY = 200
 
         private val CODE_REGEX = Regex("^[0-9*#]+#$")
         private val ID_REGEX = Regex("^[A-Za-z0-9_-]{1,64}$")
+        private val DIACRITICS_REGEX = Regex("\\p{Mn}+")
+        private val WHITESPACE_REGEX = Regex("\\s+")
         private val PROGRESS_WORDS = listOf("cours", "running", "exécution", "execution")
     }
 }

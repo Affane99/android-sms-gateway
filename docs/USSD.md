@@ -5,8 +5,9 @@ Ajout à SMS Gateway for Android : exécuter des codes USSD à plusieurs écrans
 
 ## Principe
 
-1. Le serveur envoie `POST /ussd` avec le code et les réponses à saisir, écran par écran.
-2. Le téléphone compose le code. Le service d'accessibilité lit chaque boîte USSD et saisit la réponse suivante.
+1. Le serveur envoie `POST /ussd` avec le code et les étapes : pour chaque écran, le texte attendu et la réponse.
+2. Le téléphone compose le code. Le service d'accessibilité lit chaque boîte USSD, vérifie qu'elle contient
+   le texte attendu, puis saisit la réponse. Un écran inattendu annule la session sans rien saisir.
 3. En fin de session, le webhook `ussd:completed` ou `ussd:failed` part avec les textes affichés.
 
 **Le téléphone ne confirme aucun transfert.** La preuve reste le SMS de l'opérateur
@@ -17,21 +18,36 @@ délai dépassé, ne prouve pas que l'argent n'est pas parti.
 
 `POST /ussd` (authentification Basic de l'API locale) :
 
+Exemple : transfert national Orange Money Guinée de 20 000 GNF vers le 627023108 (menu relevé le 22/11/2026).
+
 ```json
 {
   "id": "transfert-2026-000123",
   "code": "*144#",
-  "answers": ["1", "1", "620000000", "5000", "{PIN}"],
+  "steps": [
+    { "expect": "Bienvenue sur Orange Money", "answer": "1" },
+    { "expect": "Transfert National", "answer": "1" },
+    { "expect": "numero de telephone du beneficiaire", "answer": "627023108" },
+    { "expect": "montant que vous souhaitez transferer", "answer": "20000" },
+    { "expect": "frais de retrait", "answer": "1" },
+    { "expect": "Vous transferez 20000 GNF vers le 627023108", "answer": "1" },
+    { "expect": "code secret", "answer": "{PIN}" }
+  ],
   "simNumber": 1,
   "timeoutSeconds": 90
 }
 ```
 
+L'étape 6 est la protection essentielle : le récapitulatif n'est confirmé que s'il contient
+le montant ET le numéro exacts. À l'étape 5, `1` = Non (le bénéficiaire paie ses frais de retrait).
+
 | Champ | Règle |
 |---|---|
 | `id` | Clé d'idempotence, 1 à 64 caractères `A-Za-z0-9_-`. Absent : généré. |
 | `code` | Chiffres, `*` et `#`, terminé par `#`. |
-| `answers` | Une réponse par écran de saisie, 15 au plus. `{PIN}` est remplacé sur le téléphone. |
+| `steps` | Un élément par écran de saisie, 15 au plus. |
+| `steps[].expect` | Texte que l'écran doit contenir (casse, accents et espaces ignorés). Facultatif, mais obligatoire en pratique pour un transfert. |
+| `steps[].answer` | Réponse saisie. `{PIN}` est remplacé sur le téléphone. |
 | `simNumber` | 1, 2… Absent : SIM par défaut. |
 | `timeoutSeconds` | 10 à 300, défaut 90. |
 
@@ -49,10 +65,11 @@ Le contenu est le même objet que `GET /ussd/{id}`.
 ## Règles de la session
 
 - Une session à la fois, les suivantes attendent en file.
-- Un écran avec champ de saisie reçoit la réponse suivante.
-- Un écran de saisie alors qu'il ne reste aucune réponse : session annulée, `ussd:failed`.
-- Un écran sans saisie avant la dernière réponse (erreur de l'opérateur) : `ussd:failed`, le texte est dans `finalMessage`.
-- Un écran sans saisie après la dernière réponse : `ussd:completed`.
+- Un écran de saisie qui contient le texte attendu reçoit la réponse de l'étape.
+- Un écran de saisie qui ne le contient pas : session annulée sans rien saisir, `ussd:failed`.
+- Un écran de saisie alors qu'il ne reste aucune étape : session annulée, `ussd:failed`.
+- Un écran sans saisie avant la dernière étape (erreur de l'opérateur) : `ussd:failed`, le texte est dans `finalMessage`.
+- Un écran sans saisie après la dernière étape : `ussd:completed`.
 - Un id composé est enregistré AVANT de composer : il n'est jamais recomposé, même après redémarrage.
 
 ## Mise en service du téléphone
